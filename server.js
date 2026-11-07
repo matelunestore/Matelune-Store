@@ -2,7 +2,18 @@ process.env.TZ = process.env.TZ || 'Asia/Makassar';
 const os = require('os'), http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
 const PORT = process.env.PORT || 3000, PASS = process.env.ADMIN_PASSWORD || 'admin123', SHOP = process.env.SHOP_NAME || 'Toko Aksesoris';
-const db = new DatabaseSync(path.join(__dirname, 'toko.db'));
+// Lokasi database: DB_PATH (mis. volume persisten) atau toko.db di folder aplikasi.
+// Kalau folder/file tidak bisa ditulis (umum di hosting container), salin ke folder sementara supaya pesanan tetap bisa disimpan.
+let DB_FILE = process.env.DB_PATH || path.join(__dirname, 'toko.db');
+const writable = f => { try { fs.accessSync(path.dirname(f), fs.constants.W_OK); if (fs.existsSync(f)) fs.accessSync(f, fs.constants.W_OK); return true; } catch { return false; } };
+if (!writable(DB_FILE)) {
+  const alt = path.join(os.tmpdir(), 'toko.db');
+  try { if (!fs.existsSync(alt) && fs.existsSync(DB_FILE)) fs.copyFileSync(DB_FILE, alt); fs.chmodSync(alt, 0o644); } catch (e) { console.error('Gagal menyalin database:', e.message); }
+  console.warn('PERINGATAN: ' + DB_FILE + ' tidak bisa ditulis, memakai ' + alt + ' (data bisa hilang saat redeploy). Set DB_PATH ke folder yang persisten.');
+  DB_FILE = alt;
+}
+const db = new DatabaseSync(DB_FILE);
+db.exec('PRAGMA busy_timeout=5000');
 db.exec(`
 CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
 CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER, name TEXT, price INTEGER, description TEXT DEFAULT '', available INTEGER DEFAULT 1, ver INTEGER DEFAULT 0);
