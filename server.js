@@ -2,7 +2,18 @@ process.env.TZ = process.env.TZ || 'Asia/Makassar';
 const os = require('os'), http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
 const PORT = process.env.PORT || 3000, PASS = process.env.ADMIN_PASSWORD || 'admin123', SHOP = process.env.SHOP_NAME || 'Toko Aksesoris';
-const db = new DatabaseSync(path.join(__dirname, 'toko.db'));
+// Lokasi database: DB_PATH (mis. volume persisten) atau toko.db di folder aplikasi.
+// Kalau folder/file tidak bisa ditulis (umum di hosting container), salin ke folder sementara supaya pesanan tetap bisa disimpan.
+let DB_FILE = process.env.DB_PATH || path.join(__dirname, 'toko.db');
+const writable = f => { try { fs.accessSync(path.dirname(f), fs.constants.W_OK); if (fs.existsSync(f)) fs.accessSync(f, fs.constants.W_OK); return true; } catch { return false; } };
+if (!writable(DB_FILE)) {
+  const alt = path.join(os.tmpdir(), 'toko.db');
+  try { if (!fs.existsSync(alt) && fs.existsSync(DB_FILE)) fs.copyFileSync(DB_FILE, alt); fs.chmodSync(alt, 0o644); } catch (e) { console.error('Gagal menyalin database:', e.message); }
+  console.warn('PERINGATAN: ' + DB_FILE + ' tidak bisa ditulis, memakai ' + alt + ' (data bisa hilang saat redeploy). Set DB_PATH ke folder yang persisten.');
+  DB_FILE = alt;
+}
+const db = new DatabaseSync(DB_FILE);
+db.exec('PRAGMA busy_timeout=5000');
 db.exec(`
 CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
 CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER, name TEXT, price INTEGER, description TEXT DEFAULT '', available INTEGER DEFAULT 1, ver INTEGER DEFAULT 0);
@@ -18,9 +29,9 @@ const setting = k => get('SELECT value FROM settings WHERE key=?', k)?.value;
 const setS = (k, v) => run('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', k, v);
 const bump = () => setS('v', String(Date.now()));
 const IMG = /^data:image\/(png|jpe?g|webp);base64,/, IMGK = ['logo', 'banner', 'qris'];
-const dayKey = ts => { const d = new Date(ts); return ${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}; };
+const dayKey = ts => { const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 const FUL = { antar: 'Antar', ambil: 'Ambil', cod: 'COD' };
-const addIn = o => run("INSERT INTO transactions(type,amount,note,created_at,order_id) VALUES('in',?,?,?,?)", o.total, Pesanan #${o.id} - ${o.customer} (${o.method === 'cash' ? 'Tunai' : 'QRIS'}, ${FUL[o.fulfil || 'antar']}), Date.now(), o.id);
+const addIn = o => run("INSERT INTO transactions(type,amount,note,created_at,order_id) VALUES('in',?,?,?,?)", o.total, `Pesanan #${o.id} - ${o.customer} (${o.method === 'cash' ? 'Tunai' : 'QRIS'}, ${FUL[o.fulfil || 'antar']})`, Date.now(), o.id);
 const h = s => crypto.createHash('sha256').update(String(s)).digest();
 const lanIP = () => { for (const l of Object.values(os.networkInterfaces())) for (const i of l || []) if (i.family === 'IPv4' && !i.internal && !i.address.startsWith('169.254')) return i.address; };
 const err = (status, error, extra) => Object.assign(new Error(error), { status, extra });
@@ -84,6 +95,8 @@ R('POST', '/api/order/:code/review', c => {
   run('INSERT INTO reviews(order_id,customer,rating,comment,created_at) VALUES(?,?,?,?,?)', o.id, o.customer, rating, String(c.body.comment || '').trim().slice(0, 300), Date.now());
   return pub(o);
 });
+
+R('GET', '/api/date-check', () => ({ timestamp: Date.now(), formattedDate: dayKey(Date.now()) }));
 
 // ---------- ADMIN ----------
 R('POST', '/api/login', c => {
@@ -159,10 +172,10 @@ http.createServer(async (req, res) => {
       if (r.m !== req.method) continue; const m = p.match(r.re); if (!m) continue;
       if (r.admin && !sessions.has(sid)) throw err(401, 'Belum login');
       const c = { req, body, p: m.groups || {}, sid }, out = r.fn(c), hd = {};
-      if (c.setCookie !== undefined) hd['Set-Cookie'] = sid=${c.setCookie}; Path=/; HttpOnly; SameSite=Lax${req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : ''}${c.setCookie ? '' : '; Max-Age=0'};
+      if (c.setCookie !== undefined) hd['Set-Cookie'] = `sid=${c.setCookie}; Path=/; HttpOnly; SameSite=Lax${req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : ''}${c.setCookie ? '' : '; Max-Age=0'}`;
       if (out?.cache) hd['Cache-Control'] = out.cache;
       return out?.raw ? send(200, out.raw, out.type, hd) : send(200, JSON.stringify(out), 'application/json', hd);
     }
     throw err(404, 'API tidak ada');
   } catch (e) { res.writeHead(e.status || 500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.status ? e.message : 'Server error', ...e.extra })); if (!e.status) console.error(e); }
-}).listen(PORT, () => console.log(\n♡ Toko berjalan\n   Pelanggan: http://localhost:${PORT}\n   Admin    : http://localhost:${PORT}/admin  (password: ${PASS})\n   Alamat HP (satu WiFi): http://${lanIP() || 'IP-laptop'}:${PORT}\n));    
+}).listen(PORT, '0.0.0.0', () => console.log(`\n♡ Toko berjalan\n   Pelanggan: http://localhost:${PORT}\n   Admin    : http://localhost:${PORT}/admin  (password: ${PASS})\n   Alamat HP (satu WiFi): http://${lanIP() || 'IP-laptop'}:${PORT}\n`));    
