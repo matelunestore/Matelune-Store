@@ -3,16 +3,40 @@ const os = require('os'), http = require('http'), fs = require('fs'), path = req
 const { DatabaseSync } = require('node:sqlite');
 const PORT = process.env.PORT || 3000, PASS = process.env.ADMIN_PASSWORD || 'admin123', SHOP = process.env.SHOP_NAME || 'Toko Aksesoris';
 // Lokasi database: DB_PATH (mis. volume persisten) atau toko.db di folder aplikasi.
-// Kalau folder/file tidak bisa ditulis (umum di hosting container), salin ke folder sementara supaya pesanan tetap bisa disimpan.
-let DB_FILE = process.env.DB_PATH || path.join(__dirname, 'toko.db');
+// Hosting container sering membuat folder aplikasi hanya-baca. Urutan percobaan:
+// 1) file asli, 2) salinan di folder sementara, 3) database di memori (data hilang saat restart).
+const SRC_FILE = process.env.DB_PATH || path.join(__dirname, 'toko.db');
 const writable = f => { try { fs.accessSync(path.dirname(f), fs.constants.W_OK); if (fs.existsSync(f)) fs.accessSync(f, fs.constants.W_OK); return true; } catch { return false; } };
-if (!writable(DB_FILE)) {
+const tryOpen = f => {
+  try {
+    const d = new DatabaseSync(f);
+    d.exec('CREATE TABLE IF NOT EXISTS _probe(x); INSERT INTO _probe VALUES(1); DELETE FROM _probe;');
+    return d;
+  } catch (e) { console.warn('Tidak bisa menulis ke ' + f + ': ' + e.message); return null; }
+};
+let db = null, DB_FILE = SRC_FILE;
+if (fs.existsSync(SRC_FILE) || writable(SRC_FILE)) db = tryOpen(SRC_FILE);
+if (!db) {
   const alt = path.join(os.tmpdir(), 'toko.db');
-  try { if (!fs.existsSync(alt) && fs.existsSync(DB_FILE)) fs.copyFileSync(DB_FILE, alt); fs.chmodSync(alt, 0o644); } catch (e) { console.error('Gagal menyalin database:', e.message); }
-  console.warn('PERINGATAN: ' + DB_FILE + ' tidak bisa ditulis, memakai ' + alt + ' (data bisa hilang saat redeploy). Set DB_PATH ke folder yang persisten.');
-  DB_FILE = alt;
+  try { if (!fs.existsSync(alt) && fs.existsSync(SRC_FILE)) { fs.copyFileSync(SRC_FILE, alt); fs.chmodSync(alt, 0o644); } } catch (e) { console.warn('Gagal menyalin database: ' + e.message); }
+  db = tryOpen(alt); DB_FILE = alt;
+  if (db) console.warn('PERINGATAN: memakai ' + alt + ' (data bisa hilang saat redeploy). Set DB_PATH ke folder yang persisten.');
 }
-const db = new DatabaseSync(DB_FILE);
+if (!db) {
+  DB_FILE = ':memory:';
+  db = new DatabaseSync(':memory:');
+  try {
+    const src = new DatabaseSync(SRC_FILE, { readOnly: true });
+    for (const t of src.prepare("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all()) {
+      db.exec(t.sql);
+      const cols = src.prepare('PRAGMA table_info("' + t.name + '")').all().map(c => '"' + c.name + '"');
+      const ins = db.prepare('INSERT INTO "' + t.name + '"(' + cols.join(',') + ') VALUES(' + cols.map(() => '?').join(',') + ')');
+      for (const r of src.prepare('SELECT ' + cols.join(',') + ' FROM "' + t.name + '"').all()) ins.run(...Object.values(r));
+    }
+    src.close();
+  } catch (e) { console.warn('Gagal memuat data awal: ' + e.message); }
+  console.warn('PERINGATAN: tidak ada tempat untuk menulis database. Memakai database di MEMORI: pesanan hilang saat server restart. Pasang volume persisten dan set DB_PATH.');
+}
 db.exec('PRAGMA busy_timeout=5000');
 db.exec(`
 CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
@@ -98,6 +122,15 @@ R('POST', '/api/order/:code/review', c => {
 
 R('GET', '/api/date-check', () => ({ timestamp: Date.now(), formattedDate: dayKey(Date.now()) }));
 
+R('GET', '/api/diag', () => {
+  const r = { node: process.version, uid: process.getuid?.(), dbFile: DB_FILE, dbExists: fs.existsSync(DB_FILE), dirWritable: writable(DB_FILE), tz: process.env.TZ };
+  try { r.dbSize = fs.statSync(DB_FILE).size; r.dbMode = (fs.statSync(DB_FILE).mode & 0o777).toString(8); } catch (e) { r.statError = e.message; }
+  try { db.exec('BEGIN'); run("INSERT INTO settings(key,value) VALUES('_diag','1') ON CONFLICT(key) DO UPDATE SET value=excluded.value"); db.exec('ROLLBACK'); r.write = 'OK'; }
+  catch (e) { try { db.exec('ROLLBACK'); } catch {} r.write = 'GAGAL: ' + e.message; }
+  try { r.products = get('SELECT COUNT(*) n FROM products').n; r.orders = get('SELECT COUNT(*) n FROM orders').n; } catch (e) { r.readError = e.message; }
+  return r;
+});
+
 // ---------- ADMIN ----------
 R('POST', '/api/login', c => {
   const ip = c.req.socket.remoteAddress, f = fails[ip] || { n: 0, t: 0 }; if (Date.now() - f.t > 6e5) f.n = 0;
@@ -177,5 +210,5 @@ http.createServer(async (req, res) => {
       return out?.raw ? send(200, out.raw, out.type, hd) : send(200, JSON.stringify(out), 'application/json', hd);
     }
     throw err(404, 'API tidak ada');
-  } catch (e) { res.writeHead(e.status || 500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.status ? e.message : 'Server error', ...e.extra })); if (!e.status) console.error(e); }
-}).listen(PORT, '0.0.0.0', () => console.log(`\n♡ Toko berjalan\n   Pelanggan: http://localhost:${PORT}\n   Admin    : http://localhost:${PORT}/admin  (password: ${PASS})\n   Alamat HP (satu WiFi): http://${lanIP() || 'IP-laptop'}:${PORT}\n`));    
+  } catch (e) { res.writeHead(e.status || 500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.status ? e.message : 'Server error', ...e.extra })); if (!e.status) console.error('ERROR', req.method, req.url, e); }
+}).listen(PORT, '0.0.0.0', () => console.log(`\n♡ Toko berjalan\n   Pelanggan: http://localhost:${PORT}\n   Admin    : http://localhost:${PORT}/admin  (password: ${PASS})\n   Alamat HP (satu WiFi): http://${lanIP() || 'IP-laptop'}:${PORT}\n`));
