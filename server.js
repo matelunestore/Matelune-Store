@@ -98,6 +98,15 @@ R('POST', '/api/order/:code/review', c => {
 
 R('GET', '/api/date-check', () => ({ timestamp: Date.now(), formattedDate: dayKey(Date.now()) }));
 
+R('GET', '/api/diag', () => {
+  const r = { node: process.version, uid: process.getuid?.(), dbFile: DB_FILE, dbExists: fs.existsSync(DB_FILE), dirWritable: writable(DB_FILE), tz: process.env.TZ };
+  try { r.dbSize = fs.statSync(DB_FILE).size; r.dbMode = (fs.statSync(DB_FILE).mode & 0o777).toString(8); } catch (e) { r.statError = e.message; }
+  try { db.exec('BEGIN'); run("INSERT INTO settings(key,value) VALUES('_diag','1') ON CONFLICT(key) DO UPDATE SET value=excluded.value"); db.exec('ROLLBACK'); r.write = 'OK'; }
+  catch (e) { try { db.exec('ROLLBACK'); } catch {} r.write = 'GAGAL: ' + e.message; }
+  try { r.products = get('SELECT COUNT(*) n FROM products').n; r.orders = get('SELECT COUNT(*) n FROM orders').n; } catch (e) { r.readError = e.message; }
+  return r;
+});
+
 // ---------- ADMIN ----------
 R('POST', '/api/login', c => {
   const ip = c.req.socket.remoteAddress, f = fails[ip] || { n: 0, t: 0 }; if (Date.now() - f.t > 6e5) f.n = 0;
@@ -177,5 +186,5 @@ http.createServer(async (req, res) => {
       return out?.raw ? send(200, out.raw, out.type, hd) : send(200, JSON.stringify(out), 'application/json', hd);
     }
     throw err(404, 'API tidak ada');
-  } catch (e) { res.writeHead(e.status || 500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.status ? e.message : 'Server error', ...e.extra })); if (!e.status) console.error(e); }
-}).listen(PORT, '0.0.0.0', () => console.log(`\n♡ Toko berjalan\n   Pelanggan: http://localhost:${PORT}\n   Admin    : http://localhost:${PORT}/admin  (password: ${PASS})\n   Alamat HP (satu WiFi): http://${lanIP() || 'IP-laptop'}:${PORT}\n`));    
+  } catch (e) { res.writeHead(e.status || 500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.status ? e.message : 'Server error', ...e.extra })); if (!e.status) console.error('ERROR', req.method, req.url, e); }
+}).listen(PORT, '0.0.0.0', () => console.log(`\n♡ Toko berjalan\n   Pelanggan: http://localhost:${PORT}\n   Admin    : http://localhost:${PORT}/admin  (password: ${PASS})\n   Alamat HP (satu WiFi): http://${lanIP() || 'IP-laptop'}:${PORT}\n`));
